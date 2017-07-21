@@ -19,6 +19,7 @@
  */
 package org.sonar.java.se.checks;
 
+import com.google.common.collect.HashMultimap;
 import com.google.common.collect.LinkedListMultimap;
 import com.google.common.collect.Multimap;
 
@@ -31,16 +32,21 @@ import org.sonar.java.se.CheckerContext;
 import org.sonar.java.se.ExplodedGraph;
 import org.sonar.java.se.ExplodedGraph.Node;
 import org.sonar.java.se.FlowComputation;
+import org.sonar.java.se.LearnedConstraint;
 import org.sonar.java.se.ProgramState;
 import org.sonar.java.se.constraint.ObjectConstraint;
 import org.sonar.java.se.symbolicvalues.SymbolicValue;
 import org.sonar.plugins.java.api.JavaFileScannerContext;
 import org.sonar.plugins.java.api.JavaVersion;
+import org.sonar.plugins.java.api.tree.IfStatementTree;
 import org.sonar.plugins.java.api.tree.MethodInvocationTree;
 import org.sonar.plugins.java.api.tree.MethodTree;
 import org.sonar.plugins.java.api.tree.Tree;
 
+import javax.annotation.CheckForNull;
+
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
@@ -53,6 +59,7 @@ public class MapComputeIfAbsentOrPresentCheck extends SECheck implements JavaVer
   private static final MethodMatcher MAP_PUT = mapMethod("put", TypeCriteria.anyType(), TypeCriteria.anyType());
 
   private final Multimap<SymbolicValue, MapGetInvocation> mapGetInvocations = LinkedListMultimap.create();
+  private final Multimap<SymbolicValue, ObjectConstraint> valuesUsedWithConstraints = HashMultimap.create();
   private final List<CheckIssue> checkIssues = new ArrayList<>();
 
   @Override
@@ -63,6 +70,7 @@ public class MapComputeIfAbsentOrPresentCheck extends SECheck implements JavaVer
   @Override
   public void init(MethodTree methodTree, CFG cfg) {
     mapGetInvocations.clear();
+    valuesUsedWithConstraints.clear();
     checkIssues.clear();
   }
 
@@ -72,11 +80,13 @@ public class MapComputeIfAbsentOrPresentCheck extends SECheck implements JavaVer
 
   @Override
   public ProgramState checkPostStatement(CheckerContext context, Tree syntaxNode) {
+    ProgramState ps = context.getState();
+
     if (syntaxNode.is(Tree.Kind.METHOD_INVOCATION)) {
       MethodInvocationTree mit = (MethodInvocationTree) syntaxNode;
       if (MAP_GET.matches(mit)) {
         ProgramState psBeforeInvocation = context.getNode().programState;
-        ProgramState psAfterInvocation = context.getState();
+        ProgramState psAfterInvocation = ps;
 
         SymbolicValue keySV = psBeforeInvocation.peekValue(0);
         SymbolicValue mapSV = psBeforeInvocation.peekValue(1);
@@ -84,6 +94,16 @@ public class MapComputeIfAbsentOrPresentCheck extends SECheck implements JavaVer
 
         mapGetInvocations.put(mapSV, new MapGetInvocation(valueSV, keySV, mit));
       }
+    } else if (syntaxNode.is(Tree.Kind.IDENTIFIER)) {
+      SymbolicValue peekValue = ps.peekValue();
+      mapGetInvocations.values().forEach(mapGetInvocation -> {
+        if (mapGetInvocation.value.equals(peekValue)) {
+          ObjectConstraint constraint = getObjectConstraint(ps, peekValue);
+          if (constraint != null) {
+            valuesUsedWithConstraints.put(peekValue, constraint);
+          }
+        }
+      });
     }
     return super.checkPostStatement(context, syntaxNode);
   }
@@ -101,8 +121,8 @@ public class MapComputeIfAbsentOrPresentCheck extends SECheck implements JavaVer
           .filter(getOnSameMap -> getOnSameMap.withSameKey(keySV))
           .findAny()
           .ifPresent(getOnSameMap -> {
-            ObjectConstraint constraint = ps.getConstraint(getOnSameMap.value, ObjectConstraint.class);
-            if (constraint != null) {
+            ObjectConstraint constraint = getObjectConstraint(ps, getOnSameMap.value);
+            if (constraint != null && isInsideIfStatementWithNullCheckWithoutElse(mit, context.getNode(), getOnSameMap.value)) {
               checkIssues.add(new CheckIssue(context.getNode(), getOnSameMap.mit, mit, getOnSameMap.value, constraint));
             }
           });
@@ -111,13 +131,46 @@ public class MapComputeIfAbsentOrPresentCheck extends SECheck implements JavaVer
     return super.checkPreStatement(context, syntaxNode);
   }
 
-  @Override
-  public void checkEndOfExecution(CheckerContext context) {
-    SECheck check = this;
-    checkIssues.stream().filter(checkIssue -> checkIssue.isOnlyPossibleIssueForReportTree(checkIssues)).forEach(issue -> issue.report(context, check));
+  private static boolean isInsideIfStatementWithNullCheckWithoutElse(MethodInvocationTree mit, ExplodedGraph.Node startingNode, SymbolicValue value) {
+    Tree parent = mit.parent();
+    while (parent != null && !parent.is(Tree.Kind.IF_STATEMENT)) {
+      parent = parent.parent();
+    }
+    if (parent == null) {
+      return false;
+    }
+    IfStatementTree ifStatementTree = (IfStatementTree) parent;
+    return ifStatementTree.elseStatement() == null && isLearningConstraintOnIfStatement(ifStatementTree, startingNode, value);
   }
 
-  private static class CheckIssue {
+
+  private static boolean isLearningConstraintOnIfStatement(IfStatementTree ifStatementTree, Node startingNode, SymbolicValue value) {
+    // check that the syntax tree associated with the learnconstraint on value is part of the ifStatement condition
+    return true;
+  }
+
+  private static boolean learnedConstraintForValue(ExplodedGraph.Node node, SymbolicValue value) {
+    return node.edges().stream()
+      .anyMatch(edge -> {
+        Set<LearnedConstraint> learnedConstraints = edge.learnedConstraints();
+        return learnedConstraints.stream().anyMatch(lc -> lc.symbolicValue() == value);
+      });
+  }
+
+  @Override
+  public void checkEndOfExecution(CheckerContext context) {
+    checkIssues.stream()
+      .filter(CheckIssue::isOnlyPossibleIssueForReportTree)
+      .filter(CheckIssue::isAlwaysUsedWithSameConstraint)
+      .forEach(issue -> issue.report(context));
+  }
+
+  @CheckForNull
+  private static ObjectConstraint getObjectConstraint(ProgramState ps, SymbolicValue sv) {
+    return ps.getConstraint(sv, ObjectConstraint.class);
+  }
+
+  private class CheckIssue {
     private final ExplodedGraph.Node node;
 
     private final MethodInvocationTree getInvocation;
@@ -136,16 +189,21 @@ public class MapComputeIfAbsentOrPresentCheck extends SECheck implements JavaVer
       this.valueConstraint = valueConstraint;
     }
 
-    private boolean isOnlyPossibleIssueForReportTree(List<CheckIssue> otherIssues) {
-      return otherIssues.stream().noneMatch(this::differentIssueOnSameTree);
+    private boolean isOnlyPossibleIssueForReportTree() {
+      return checkIssues.stream().noneMatch(this::differentIssueOnSameTree);
     }
 
     private boolean differentIssueOnSameTree(CheckIssue otherIssue) {
       return this != otherIssue && getInvocation.equals(otherIssue.getInvocation) && valueConstraint != otherIssue.valueConstraint;
     }
 
-    private void report(CheckerContext context, SECheck check) {
-      context.reportIssue(getInvocation, check, issueMsg(), flows());
+    private boolean isAlwaysUsedWithSameConstraint() {
+      Collection<ObjectConstraint> valueUsedWithConstraints = valuesUsedWithConstraints.get(value);
+      return valueUsedWithConstraints.isEmpty() || (valueUsedWithConstraints.size() == 1 && valueUsedWithConstraints.contains(valueConstraint));
+    }
+
+    private void report(CheckerContext context) {
+      context.reportIssue(getInvocation, MapComputeIfAbsentOrPresentCheck.this, issueMsg(), flows());
     }
 
     private String issueMsg() {
